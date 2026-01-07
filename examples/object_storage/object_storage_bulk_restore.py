@@ -1,5 +1,30 @@
 # Custom start and end prefixes - Ryan Helferich
 
+# - Added CLI flags:
+
+#   - \--start-prefix / -sps: inclusive lower bound
+#   - \--end-prefix / -spe: inclusive upper bound
+
+# - If both flags are supplied, the script restores all objects whose names are lexicographically between start-prefix (inclusive) and the next string after end-prefix (exclusive). This includes all “folders” like date=YYYY-MM-DD and their contents within the range.
+
+# - Validation:
+
+#   - Both flags must be provided together
+#   - start-prefix must be <= end-prefix
+
+# - Existing -sp (single prefix) behavior is preserved when the range is not used.
+
+# How it works
+
+# - Uses Object Storage list_objects with start and end parameters to page through all objects in the lexicographic range. This efficiently targets only the desired subset.
+# - The end bound is computed to include everything under the provided end-prefix. For example, end-prefix date=2025-10-29 will include all objects beginning with date=2025-10-29.
+
+# Usage Exmaple
+# - Restore all objects under date “folders” from 2025-05-21 through 2025-10-29 inclusive: 
+# python examples/object_storage/object_storage_bulk_restore.py -sb YOUR_BUCKET -sr YOUR_REGION --start-prefix date=2025-05-21 --end-prefix date=2025-10-29
+
+# -------------------
+
 # coding: utf-8
 # Copyright (c) 2016, 2025, Oracle and/or its affiliates.  All rights reserved.
 # This software is dual-licensed to you under the Universal Permissive License (UPL) 1.0 as shown at https://oss.oracle.com/licenses/upl or Apache License 2.0 as shown at http://www.apache.org/licenses/LICENSE-2.0. You may choose either license.
@@ -54,6 +79,8 @@ parser.add_argument('-sb', default="", dest='source_bucket', help='Source Bucket
 parser.add_argument('-sp', default="", dest='source_prefix_include', help='Source Prefix Include')
 parser.add_argument('-sr', default="", dest='source_region', help='Source Region')
 parser.add_argument('-sn', default="", dest='source_namespace', help='Source Namespace (Default current connection)')
+parser.add_argument('--start-prefix', '-sps', default="", dest='start_prefix', help='Start prefix (inclusive) for range filtering')
+parser.add_argument('--end-prefix', '-spe', default="", dest='end_prefix', help='End prefix (inclusive) for range filtering')
 cmd = parser.parse_args()
 
 if len(sys.argv) < 1:
@@ -86,6 +113,18 @@ source_bucket = cmd.source_bucket
 source_prefix = cmd.source_prefix_include
 source_region = cmd.source_region
 source_namespace = cmd.source_namespace
+start_prefix_range = cmd.start_prefix
+end_prefix_range = cmd.end_prefix
+
+# Validate start/end prefix usage
+if (start_prefix_range and not end_prefix_range) or (end_prefix_range and not start_prefix_range):
+    print("Both --start-prefix and --end-prefix must be provided together.")
+    parser.print_help()
+    raise SystemExit
+
+if start_prefix_range and end_prefix_range and start_prefix_range > end_prefix_range:
+    print("Start prefix must be lexicographically less than or equal to end prefix.")
+    raise SystemExit
 
 
 ##########################################################################
@@ -189,7 +228,10 @@ def print_command_info():
     print("Command Line          : " + ' '.join(x for x in sys.argv[1:]))
     print("Source Namespace      : " + source_namespace)
     print("Source Bucket         : " + source_bucket)
-    print("Source Prefix Include : " + source_prefix)
+    if start_prefix_range and end_prefix_range:
+        print("Source Prefix Range   : %s -> %s" % (start_prefix_range, end_prefix_range))
+    else:
+        print("Source Prefix Include : " + source_prefix)
 
 
 ##############################################################################
@@ -242,6 +284,46 @@ def add_objects_to_queue(ns, source_bucket):
             q.put(object_.name)
             count += 1
 
+            if count % 100000 == 0:
+                print(get_time() + " -    Added " + str(count) + " files to queue...")
+
+        if not next_starts_with:
+            break
+
+    return count
+
+
+def _next_lexicographic_string(s):
+    if not s:
+        return s
+    return s[:-1] + chr(ord(s[-1]) + 1)
+
+
+def add_objects_to_queue_range(ns, source_bucket, start_prefix, end_upper_bound):
+    """
+    Enqueue all objects whose names are in the lexicographic range:
+    start_prefix <= name < end_upper_bound
+    This effectively covers all objects under any "folder" that starts with prefixes
+    between start_prefix and end_prefix (inclusive), where end_upper_bound should be
+    computed as next lexicographic string after the desired end_prefix.
+    """
+    global q
+
+    count = 0
+    next_starts_with = start_prefix
+    while True:
+        response = object_storage_client.list_objects(
+            ns,
+            source_bucket,
+            start=next_starts_with,
+            end=end_upper_bound,
+            retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY
+        )
+        next_starts_with = response.data.next_start_with
+
+        for object_ in response.data.objects:
+            q.put(object_.name)
+            count += 1
             if count % 100000 == 0:
                 print(get_time() + " -    Added " + str(count) + " files to queue...")
 
@@ -315,8 +397,12 @@ def main():
         w.daemon = True
         w.start()
 
-    print(get_time() + " - Getting list of objects from source source_bucket (%s). Restores will start immediately." % (source_bucket))
-    count = add_objects_to_queue(source_namespace, source_bucket)
+    if start_prefix_range and end_prefix_range:
+        print(get_time() + " - Getting list of objects in prefix range [%s .. %s] from source bucket (%s). Restores will start immediately." % (start_prefix_range, end_prefix_range, source_bucket))
+        count = add_objects_to_queue_range(source_namespace, source_bucket, start_prefix_range, _next_lexicographic_string(end_prefix_range))
+    else:
+        print(get_time() + " - Getting list of objects from source source_bucket (%s). Restores will start immediately." % (source_bucket))
+        count = add_objects_to_queue(source_namespace, source_bucket)
     print(get_time() + " - Enqueued %s objects to be restored" % (count))
 
     while count > 0:
